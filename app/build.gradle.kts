@@ -144,7 +144,6 @@ dependencies {
     androidTestImplementation(libs.androidx.test.rules)
     androidTestImplementation(libs.androidx.test.ext.junit)
     implementation(project(":lib"))
-    implementation(project(":shared"))
 
     implementation(platform(libs.compose.bom))
 
