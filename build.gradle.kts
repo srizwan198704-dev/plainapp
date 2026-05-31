@@ -8,21 +8,19 @@ buildscript {
         classpath(libs.gradle)
         classpath(libs.kotlin.gradle.plugin)
         classpath(libs.room.gradle)
-        classpath(libs.google.services)
-        classpath(libs.firebase.crashlytics.gradle)
     }
 }
 
 plugins {
     alias(libs.plugins.devtools.ksp) apply false
     alias(libs.plugins.compose.compiler) apply false
+    alias(libs.plugins.compose.multiplatform) apply false
 }
 
 allprojects {
     repositories {
         google()
         mavenCentral()
-        maven("https://jitpack.io")
     }
 }
 
