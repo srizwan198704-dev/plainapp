@@ -1,0 +1,245 @@
+package com.ismartcoding.plain.web
+
+import com.ismartcoding.lib.channel.sendEvent
+import com.ismartcoding.lib.helpers.CryptoHelper
+import com.ismartcoding.lib.helpers.JsonHelper
+import com.ismartcoding.lib.kgraphql.Context
+import com.ismartcoding.lib.kgraphql.GraphqlRequest
+import com.ismartcoding.lib.kgraphql.KGraphQL
+import com.ismartcoding.lib.kgraphql.context
+import com.ismartcoding.lib.kgraphql.schema.Schema
+import com.ismartcoding.lib.kgraphql.schema.dsl.SchemaBuilder
+import com.ismartcoding.lib.kgraphql.schema.dsl.SchemaConfigurationDSL
+import com.ismartcoding.plain.MainApp
+import com.ismartcoding.plain.TempData
+import com.ismartcoding.plain.channel.ChannelSystemMessageHandler
+import com.ismartcoding.plain.chat.ChatCacheManager
+import com.ismartcoding.plain.chat.ChatDbHelper
+import com.ismartcoding.plain.chat.PeerChatHelper
+import com.ismartcoding.plain.chat.download.DownloadQueue
+import com.ismartcoding.plain.db.AppDatabase
+import com.ismartcoding.plain.db.DChat
+import com.ismartcoding.plain.db.DChatChannel
+import com.ismartcoding.plain.db.DMessageFiles
+import com.ismartcoding.plain.db.DMessageImages
+import com.ismartcoding.plain.db.DMessageType
+import com.ismartcoding.plain.db.getMessagePreview
+import com.ismartcoding.plain.events.EventType
+import com.ismartcoding.plain.events.FetchLinkPreviewsEvent
+import com.ismartcoding.plain.events.HMessageCreatedEvent
+import com.ismartcoding.plain.events.WebSocketEvent
+import com.ismartcoding.plain.features.locale.LocaleHelper
+import com.ismartcoding.plain.helpers.NotificationHelper
+import com.ismartcoding.plain.i18n.Res
+import com.ismartcoding.plain.i18n.peer_chat
+import com.ismartcoding.plain.web.models.ChatItem
+import com.ismartcoding.plain.web.models.ID
+import com.ismartcoding.plain.web.models.toModel
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.BaseApplicationPlugin
+import io.ktor.server.request.header
+import io.ktor.server.request.receive
+import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytes
+import io.ktor.server.routing.post
+import io.ktor.server.routing.route
+import io.ktor.server.routing.routing
+import io.ktor.util.AttributeKey
+import kotlinx.serialization.json.Json
+import kotlin.time.Instant
+
+class PeerGraphQL(val schema: Schema) {
+    class Configuration : SchemaConfigurationDSL() {
+        fun init() {
+            schemaBlock = {
+                type<ChatItem> {
+                    property("data") {
+                        resolver { c: ChatItem ->
+                            c.getContentData()
+                        }
+                    }
+                }
+                mutation("channelSystemMessage") {
+                    resolver { type: String, payload: String, context: Context ->
+                        val call = context.get<ApplicationCall>()!!
+                        val fromId = call.request.header("c-id") ?: ""
+                        ChannelSystemMessageHandler.handle(fromId, type, payload)
+                        true
+                    }
+                }
+                mutation("createChatItem") {
+                    resolver { content: String, context: Context ->
+                        val call = context.get<ApplicationCall>()!!
+
+                        val fromId = call.request.header("c-id") ?: ""
+                        val channelId = call.request.header("c-cid") ?: ""
+
+                        // Reject channel messages if we have left or been kicked
+                        if (channelId.isNotEmpty()) {
+                            val ch = AppDatabase.instance.chatChannelDao().getById(channelId)
+                            if (ch == null || ch.status != DChatChannel.STATUS_JOINED) {
+                                throw IllegalStateException("Channel not joined")
+                            }
+                        }
+
+                        val item =
+                            ChatDbHelper.sendAsync(
+                                DChat.parseContent(content),
+                                fromId,
+                                toId = if (channelId.isEmpty()) "me" else "",
+                                channelId = channelId
+                            )
+
+                        if (item.content.type == DMessageType.TEXT.value) {
+                            sendEvent(FetchLinkPreviewsEvent(item))
+                        }
+
+                        // Download files from peer automatically using queue
+                        if (setOf(
+                                DMessageType.FILES.value,
+                                DMessageType.IMAGES.value
+                            ).contains(item.content.type)
+                        ) {
+                            val files = when (item.content.value) {
+                                is DMessageFiles -> (item.content.value as DMessageFiles).items
+                                is DMessageImages -> (item.content.value as DMessageImages).items
+                                else -> emptyList()
+                            }
+
+                            val peer = AppDatabase.instance.peerDao().getById(fromId)
+                            if (peer != null) {
+                                // Add files to download queue instead of downloading directly
+                                files.forEach { file ->
+                                    DownloadQueue.addDownloadTask(
+                                        messageFile = file,
+                                        peer = peer,
+                                        messageId = item.id
+                                    )
+                                }
+                            }
+                        }
+
+                        sendEvent(HMessageCreatedEvent(channelId.ifEmpty { fromId }, arrayListOf(item)))
+                        val model = item.toModel()
+                        model.data = model.getContentData()
+                        sendEvent(
+                            WebSocketEvent(
+                                EventType.MESSAGE_CREATED,
+                                JsonHelper.jsonEncode(listOf(model))
+                            )
+                        )
+
+                        // Send local notification with reply support
+                        // Skip notification when the user already has this peer's chat open.
+                        val notificationPeer = AppDatabase.instance.peerDao().getById(fromId)
+                        if (channelId.isEmpty()) {
+                            // Peer-to-peer message
+                            if (notificationPeer != null && ChatCacheManager.activeChatPeerId != fromId) {
+                                NotificationHelper.sendPeerMessageNotification(
+                                    context = MainApp.instance,
+                                    peerId = fromId,
+                                    peerName = notificationPeer.name.ifEmpty { LocaleHelper.getStringSync(Res.string.peer_chat) },
+                                    messageText = item.getMessagePreview(),
+                                )
+                            }
+                        } else {
+                            // Channel message
+                            val notificationChannel = AppDatabase.instance.chatChannelDao().getById(channelId)
+                            if (notificationChannel != null && ChatCacheManager.activeChatChannelId != channelId) {
+                                val senderName = notificationPeer?.name?.ifEmpty { null }
+                                val messageText = if (senderName != null) {
+                                    "$senderName: ${item.getMessagePreview()}"
+                                } else {
+                                    item.getMessagePreview()
+                                }
+                                NotificationHelper.sendPeerMessageNotification(
+                                    context = MainApp.instance,
+                                    peerId = channelId,
+                                    peerName = notificationChannel.name.ifEmpty { LocaleHelper.getStringSync(Res.string.peer_chat) },
+                                    messageText = messageText,
+                                )
+                            }
+                        }
+
+                        arrayListOf(item).map { it.toModel() }
+                    }
+                }
+                stringScalar<Instant> {
+                    deserialize = { value: String -> Instant.parse(value) }
+                    serialize = Instant::toString
+                }
+
+                stringScalar<ID> {
+                    deserialize = { it: String -> ID(it) }
+                    serialize = { it: ID -> it.toString() }
+                }
+            }
+        }
+
+        internal var schemaBlock: (SchemaBuilder.() -> Unit)? = null
+    }
+
+    companion object Feature : BaseApplicationPlugin<Application, Configuration, PeerGraphQL> {
+        override val key = AttributeKey<PeerGraphQL>("PeerGraphQL")
+
+        private suspend fun executeGraphqlQL(
+            schema: Schema,
+            query: String,
+            call: ApplicationCall
+        ): String {
+            val request = Json.decodeFromString(GraphqlRequest.serializer(), query)
+            return schema.execute(request.query, request.variables?.toString(), context {
+                +call
+            })
+        }
+
+        override fun install(
+            pipeline: Application,
+            configure: Configuration.() -> Unit,
+        ): PeerGraphQL {
+            val config = Configuration().apply(configure)
+            val schema =
+                KGraphQL.schema {
+                    configuration = config
+                    config.schemaBlock?.invoke(this)
+                }
+
+            pipeline.routing {
+                route("/peer_graphql") {
+                    post {
+                        if (!TempData.webEnabled) {
+                            call.respond(HttpStatusCode.Forbidden)
+                            return@post
+                        }
+                        val clientId = call.request.header("c-id") ?: ""
+                        val channelId = call.request.header("c-cid") ?: ""
+                        // Determine the decryption key:
+                        // 1. If c-cid is present, always use the channel key (supports non-paired members).
+                        // 2. Otherwise, use the peer's shared key (paired peer-to-peer chat).
+                        val token = if (channelId.isNotEmpty()) {
+                            ChatCacheManager.channelKeyCache[channelId]
+                        } else {
+                            ChatCacheManager.peerKeyCache[clientId]
+                        }
+                        val publicKey = ChatCacheManager.peerPublicKeyCache[clientId]
+                        if (token == null || publicKey == null) {
+                            call.respond(HttpStatusCode.Unauthorized)
+                            return@post
+                        }
+                        val decryptResult = PeerChatHelper.decrypt(token, clientId, publicKey, call.receive())
+                        if (decryptResult.content == null) {
+                            call.respond(decryptResult.code)
+                            return@post
+                        }
+
+                        val r = executeGraphqlQL(schema, decryptResult.content, call)
+                        call.respondBytes(CryptoHelper.chaCha20Encrypt(token, r))
+                    }
+                }
+            }
+            return PeerGraphQL(schema)
+        }
+    }
+}

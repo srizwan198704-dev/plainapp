@@ -1,0 +1,73 @@
+package com.ismartcoding.plain.mdns
+
+import com.ismartcoding.lib.helpers.NetworkHelper
+import java.net.Inet4Address
+import java.net.NetworkInterface
+
+/**
+ * Interface selection utilities for the mDNS responder.
+ * Extracted to keep MdnsHostResponder under the line limit and to enable unit testing
+ * of the purely logical (no-Context) functions.
+ */
+
+/**
+ * Returns non-loopback, non-VPN, multicast-capable interfaces that carry an IPv4
+ * address. Mobile-data bearers (rmnet*, ccmni*) are excluded — they are never part
+ * of a LAN and would cause mDNS replies to egress via the wrong path.
+ */
+internal fun candidateInterfaces(): List<Pair<NetworkInterface, Inet4Address>> {
+    val result = mutableListOf<Pair<NetworkInterface, Inet4Address>>()
+    runCatching {
+        val ifaces = NetworkInterface.getNetworkInterfaces() ?: return result
+        for (iface in ifaces.asSequence()) {
+            if (!iface.isUp || iface.isLoopback) continue
+            if (NetworkHelper.isVpnInterface(iface.name)) continue
+            if (isMobileDataInterface(iface.name)) continue
+            // Samsung's Wi-Fi driver sometimes omits IFF_MULTICAST on wlan0/ap0, causing
+            // supportsMulticast() to return false even though the interface is perfectly
+            // capable of multicast. Accept any interface with a Wi-Fi/Ethernet-like name
+            // regardless of the flag, since those are always LAN interfaces.
+            val isLanLike = iface.name.startsWith("wlan") || iface.name.startsWith("ap") ||
+                iface.name.startsWith("eth") || iface.name.startsWith("swlan") ||
+                iface.name.startsWith("wl") || iface.name.startsWith("p2p") ||
+                iface.name.startsWith("wifi") // Android 17+ may use wifi0/wifi_sta0 naming
+            if (!iface.supportsMulticast() && !isLanLike) continue
+            val ip = iface.inetAddresses.asSequence()
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull { !it.isLoopbackAddress } ?: continue
+            result += iface to ip
+        }
+    }
+    return result
+}
+
+/** Returns true for mobile-data-only bearer interface names (never LAN). */
+internal fun isMobileDataInterface(name: String): Boolean =
+    name.startsWith("rmnet") || name.startsWith("ccmni") ||
+        name.startsWith("v4-rmnet") || name.startsWith("v6-rmnet") ||
+        name.startsWith("clat") || name.startsWith("v4-ccmni")
+
+/**
+ * Returns the local interface and IP whose subnet contains [senderIp], or the
+ * first candidate as a fallback. The returned IP is embedded in the DNS A record
+ * so the querier knows which address to connect to.
+ */
+internal fun findResponseIface(
+    senderIp: Inet4Address,
+    candidates: List<Pair<NetworkInterface, Inet4Address>>,
+): Pair<NetworkInterface, Inet4Address> {
+    for ((iface, localIp) in candidates) {
+        val ia = iface.interfaceAddresses.firstOrNull { it.address == localIp } ?: continue
+        val bits = ia.networkPrefixLength.toInt()
+        val mask = if (bits == 0) 0 else (0xFFFFFFFFL shl (32 - bits)).toInt()
+        if ((ipToInt(localIp) and mask) == (ipToInt(senderIp) and mask)) return iface to localIp
+    }
+    return candidates.first()
+}
+
+/** Converts an [Inet4Address] to a 32-bit big-endian integer for subnet arithmetic. */
+internal fun ipToInt(ip: Inet4Address): Int {
+    val b = ip.address
+    return ((b[0].toInt() and 0xFF) shl 24) or ((b[1].toInt() and 0xFF) shl 16) or
+        ((b[2].toInt() and 0xFF) shl 8) or (b[3].toInt() and 0xFF)
+}
