@@ -1,0 +1,69 @@
+name: Rename Package and Build Debug APK
+
+on:
+  push:
+    branches:
+      - main # main ব্রাঞ্চে কোড পুশ হলেই এই অ্যাকশনটি রান হবে
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ১. কোড ক্লোন করা
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # ২. জাভা এনভায়রনমেন্ট সেটআপ করা (Android বিল্ডের জন্য প্রয়োজন)
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      # ৩. পুরো প্রজেক্টে প্যাকেজ নাম পরিবর্তন করা (com.ismartcoding.plain -> com.konasl.nagad)
+      # এখানে সব ফাইল, ফোল্ডার এবং জাভা/কোটলিন সোর্স কোডের ভেতরের প্যাকেজ নাম বদলে যাবে
+      - name: Rename Package Name
+        run: |
+          echo "Replacing package name in all files..."
+          
+          # ফাইলের ভেতরের টেক্সট পরিবর্তন (build.gradle, Manifest, Java/Kotlin files ইত্যাদি)
+          find . -type f -not -path '*/.*' -exec sed -i 's/com.ismartcoding.plain/com.konasl.nagad/g' {} +
+
+          # ফোল্ডার স্ট্রাকচার পরিবর্তন করা (উৎস কোডের ডিরেক্টরি রিনেইম করা)
+          # সাধারণত অ্যান্ড্রয়েডে src/main/java বা src/main/kotlin এর ভেতর প্যাকেজ ফোল্ডার থাকে
+          echo "Moving folder structures..."
+          
+          # java ফোল্ডারের জন্য স্ট্রাকচার পরিবর্তন
+          find . -path "*/src/*/java/com/ismartcoding/plain" -type d | while read -r dir; do
+              basename=$(dirname "$dir")
+              mkdir -p "$basename/konasl/nagad"
+              mv "$dir"/* "$basename/konasl/nagad/"
+              rm -rf "$dir"
+          done
+
+          # kotlin ফোল্ডারের জন্য স্ট্রাকচার পরিবর্তন (যদি প্রোজেক্টে কোটলিন থাকে)
+          find . -path "*/src/*/kotlin/com/ismartcoding/plain" -type d | while read -r dir; do
+              basename=$(dirname "$dir")
+              mkdir -p "$basename/konasl/nagad"
+              mv "$dir"/* "$basename/konasl/nagad/"
+              rm -rf "$dir"
+          done
+
+          echo "Package rename completed successfully!"
+
+      # ৪. Gradle স্ক্রিপ্ট রান করার পারমিশন দেওয়া
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      # ৫. অ্যান্ড্রয়েড ডিবাগ এপিকে (Debug APK) বিল্ড করা
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+
+      # ৬. তৈরি হওয়া APK-টি GitHub-এ আপলোড করা (যাতে আপনি ডাউনলোড করতে পারেন)
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
